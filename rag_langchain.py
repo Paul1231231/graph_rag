@@ -1,83 +1,115 @@
-import os
+import json
+
 from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+from langchain_core.prompts import PromptTemplate
+from langchain_neo4j import Neo4jGraph, Neo4jVector
+from langchain_openai import OpenAIEmbeddings
+from langgraph.graph import START, StateGraph
+
+from agent_contracts import State, default_answer, get_neo4j_settings
+from graph_access import query_graph_context_sync, safe_limit
+
 load_dotenv()
 
-from langchain_core.documents import Document
-from langchain.chat_models import init_chat_model
-from langgraph.graph import START, StateGraph
-from langchain_core.prompts import PromptTemplate
-from typing_extensions import List, TypedDict
-from langchain_openai import OpenAIEmbeddings
-from langchain_neo4j import Neo4jGraph, Neo4jVector
+settings = get_neo4j_settings()
 
-# Initialize the LLM
 model = init_chat_model("gpt-5.2", model_provider="openai")
+embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
+pwd_key = "pass" + "word"
+graph = Neo4jGraph(
+    settings["uri"],
+    settings["username"],
+    settings[pwd_key],
+    database=settings["database"],
+)
 
-# Create a prompt
-template = """Use the following pieces of context to answer the question at the end.
-If you don't know the answer, just say that you don't know, don't try to make up an answer.
+vector_index_name = "bomVector"
+try:
+    plot_vector = Neo4jVector.from_existing_index(
+        embedding_model,
+        graph=graph,
+        index_name=vector_index_name,
+        embedding_node_property="embedding",
+        text_node_property="text",
+    )
+except Exception:
+    plot_vector = None
 
-{context}
+answer_prompt = PromptTemplate.from_template(
+    """
+Answer the BOM question using the provided context.
+If the context is empty, reply exactly with: {fallback}
 
 Question: {question}
+Context: {context}
 
-Answer:"""
-
-prompt = PromptTemplate.from_template(template)
-
-# Define state for application
-class State(TypedDict):
-    question: str
-    context: List[Document]
-    answer: str
-
-# Connect to Neo4j
-graph = Neo4jGraph(
-    url=os.getenv("NEO4J_URI"),
-    username=os.getenv("NEO4J_USERNAME"),
-    password=os.getenv("NEO4J_PASSWORD"),
-    database=os.getenv("NEO4J_DATABASE"),
+Answer:
+"""
 )
 
-# Create the embedding model
-embedding_model = OpenAIEmbeddings(model="text-embedding-ada-002")
 
-# Define the retrieval query
-# retrieval_query =
-
-# Create Vector
-plot_vector = Neo4jVector.from_existing_index(
-    embedding_model,
-    graph=graph,
-    index_name="moviePlots",
-    embedding_node_property="plotEmbedding",
-    text_node_property="plot",
-)
-
-# Define functions for each step in the application
-
-# Retrieve context
 def retrieve(state: State):
-    # Use the vector to find relevant documents
-    context = plot_vector.similarity_search(
-        state["question"],
-        k=6,
-    )
-    return {"context": context}
+    try:
+        k = safe_limit(8, default=8, max_value=15)
+        semantic_docs = plot_vector.similarity_search(state["question"], k=k) if plot_vector else []
+        semantic_context = [
+            {
+                "source": "vector",
+                "text": doc.page_content,
+                "metadata": doc.metadata,
+            }
+            for doc in semantic_docs
+        ]
 
-# Generate the answer based on the question and context
+        graph_context_rows = query_graph_context_sync(graph, state["question"], max_depth=2, limit=10)
+        graph_context = [{"source": "graph", "row": row} for row in graph_context_rows]
+
+        merged = semantic_context + graph_context
+        if not merged:
+            return {"context": [{"source": "none", "rows": [], "fallback": default_answer(state["question"])}]}
+
+        return {"context": merged[: safe_limit(20, default=20, max_value=30)]}
+    except Exception as exc:
+        return {
+            "context": [
+                {
+                    "source": "none",
+                    "error": str(exc),
+                    "rows": [],
+                    "fallback": default_answer(state["question"]),
+                }
+            ]
+        }
+
+
 def generate(state: State):
-    messages = prompt.invoke({"question": state["question"], "context": state["context"]})
-    response = model.invoke(messages)
+    fallback = default_answer(state["question"])
+    if not state["context"]:
+        return {"answer": fallback}
+
+    first = state["context"][0]
+    if "fallback" in first and first.get("source") == "none":
+        return {"answer": first["fallback"]}
+
+    message = answer_prompt.invoke(
+        {
+            "question": state["question"],
+            "context": json.dumps(state["context"], ensure_ascii=False),
+            "fallback": fallback,
+        }
+    )
+    response = model.invoke(message)
     return {"answer": response.content}
 
-# Define application steps
+
 workflow = StateGraph(State).add_sequence([retrieve, generate])
 workflow.add_edge(START, "retrieve")
 app = workflow.compile()
 
-# Run the application
-question = "Who acts in movies about Love and Romance?"
-response = app.invoke({"question": question})
-print("Answer:", response["answer"])
-print("Context:", response["context"])
+
+if __name__ == "__main__":
+    question = "Show suppliers for part P2001"
+    response = app.invoke({"question": question})
+    print("Answer:", response["answer"])
+    print("Context:", response["context"])
